@@ -3,6 +3,7 @@ livekit-api
 livekit-plugins-deepgram
 livekit-plugins-openai
 livekit-plugins-cartesia
+livekit-plugins-noise-cancellation
 openai
 python-dotenv
 fastapi
