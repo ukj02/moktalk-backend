@@ -2,6 +2,7 @@ import json
 import os
 import uuid
 import asyncio
+import threading
 from datetime import datetime
 from dotenv import load_dotenv
 
@@ -11,6 +12,8 @@ from livekit.plugins import (
     openai,
     noise_cancellation,
 )
+from fastapi import FastAPI
+import uvicorn
 
 load_dotenv(".env")
 
@@ -642,5 +645,30 @@ async def my_agent(ctx: agents.JobContext):
     )
 
 
+# Health check server for Railway deployment
+health_app = FastAPI()
+
+@health_app.get("/health")
+async def health_check():
+    """Health check endpoint for Railway"""
+    return {"status": "healthy", "service": "moktalk-agent"}
+
+@health_app.get("/")
+async def root():
+    """Root endpoint"""
+    return {"status": "ok", "service": "moktalk-agent"}
+
+def run_health_server():
+    """Run health check server in background thread"""
+    port = int(os.getenv("PORT", 8080))
+    uvicorn.run(health_app, host="0.0.0.0", port=port, log_level="warning")
+
+
 if __name__ == "__main__":
+    # Start health check server in background thread for Railway
+    health_thread = threading.Thread(target=run_health_server, daemon=True)
+    health_thread.start()
+    print(f"✅ Health check server started on port {os.getenv('PORT', 8080)}")
+    
+    # Start the agent service
     agents.cli.run_app(server)

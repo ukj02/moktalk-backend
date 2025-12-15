@@ -1,0 +1,2 @@
+web: python agent_service.py start
+
