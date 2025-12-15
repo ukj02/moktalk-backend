@@ -53,6 +53,6 @@ echo "────────────────────────�
 echo ""
 
 # Start the agent service
-python agent_service.py dev
+python agent_service.py start
 
 
