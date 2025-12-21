@@ -3,11 +3,26 @@ import os
 import uuid
 import asyncio
 import threading
+import time
+import base64
 from datetime import datetime
+from typing import AsyncIterable, Optional, List
 from dotenv import load_dotenv
 
 from livekit import agents, rtc, api
-from livekit.agents import AgentServer, AgentSession, Agent, room_io
+from livekit.agents import (
+    AgentServer, 
+    AgentSession, 
+    Agent, 
+    room_io,
+    llm,
+    ChatContext,
+    ChatMessage,
+    FunctionTool,
+    ModelSettings,
+)
+from livekit.agents.llm import ImageContent
+from livekit.agents.utils import images
 from livekit.plugins import (
     openai,
     noise_cancellation,
@@ -23,6 +38,8 @@ current_room = None
 transcription_history = []
 # Store egress info for recording tracking
 egress_info_storage = {}
+# Store latest video frame for multimodal context
+latest_screen_frame = {"frame": None, "timestamp": 0}
 
 
 async def send_transcription(
@@ -66,8 +83,95 @@ async def send_transcription(
 
 
 class Assistant(Agent):
-    def __init__(self, instructions: str = "You are a helpful voice AI assistant.") -> None:
+    def __init__(self, instructions: str = "You are a helpful voice AI assistant.", room: rtc.Room = None) -> None:
+        self._video_stream = None
+        self._tasks = []
+        self._room = room
         super().__init__(instructions=instructions)
+    
+    async def on_enter(self):
+        """Called when agent joins the room - set up video tracking"""
+        if not self._room:
+            print("⚠️  Room not available in Assistant, skipping video setup")
+            return
+        
+        # Watch for screen share tracks from remote participants
+        @self._room.on("track_subscribed")
+        def on_track_subscribed(track: rtc.Track, publication: rtc.RemoteTrackPublication, participant: rtc.RemoteParticipant):
+            # Check if this is a screen share track - use SOURCE_SCREEN_SHARE_VIDEO for video tracks
+            if publication.source == rtc.TrackSource.SOURCE_SCREEN_SHARE_VIDEO and track.kind == rtc.TrackKind.KIND_VIDEO:
+                print(f"🖥️  Screen share track detected, starting video stream capture")
+                self._create_video_stream(track)
+    
+    async def on_user_turn_completed(self, turn_ctx: ChatContext, new_message: ChatMessage) -> None:
+        """Called when user finishes speaking - add latest screen frame to context"""
+        global latest_screen_frame
+        
+        # If we have a recent screen frame, add it to the conversation context
+        if latest_screen_frame["frame"] is not None:
+            # Check if frame is recent (within last 5 seconds)
+            current_time = time.time()
+            if current_time - latest_screen_frame["timestamp"] < 5:
+                print(f"📸 Adding screen frame to conversation context (age: {current_time - latest_screen_frame['timestamp']:.1f}s)")
+                
+                # Add the frame as visual context
+                new_message.content.append(
+                    ImageContent(image=latest_screen_frame["frame"])
+                )
+                
+                # Also add a text prompt to analyze the screen
+                if isinstance(new_message.content[0], str):
+                    # If first item is text, enhance it
+                    original_text = new_message.content[0]
+                    new_message.content[0] = f"{original_text}\n\n[Note: You can see the candidate's screen share in the attached image. Consider what they're working on when responding.]"
+    
+    def _create_video_stream(self, track: rtc.Track):
+        """Create video stream to capture frames from screen share"""
+        global latest_screen_frame
+        
+        # Close any existing stream
+        if self._video_stream is not None:
+            self._video_stream.close()
+        
+        # Create new video stream
+        self._video_stream = rtc.VideoStream(track)
+        
+        async def read_stream():
+            """Continuously read and buffer the latest frame"""
+            frame_count = 0
+            async for event in self._video_stream:
+                frame_count += 1
+                
+                # Sample every 30 frames (roughly once per second at 30fps)
+                if frame_count % 30 == 0:
+                    try:
+                        # Encode frame to JPEG with reasonable size
+                        image_bytes = images.encode(
+                            event.frame,
+                            images.EncodeOptions(
+                                format="JPEG",
+                                resize_options=images.ResizeOptions(
+                                    width=1024,
+                                    height=1024,
+                                    strategy="scale_aspect_fit"
+                                ),
+                                quality=85
+                            )
+                        )
+                        
+                        # Store as base64 data URL
+                        latest_screen_frame["frame"] = f"data:image/jpeg;base64,{base64.b64encode(image_bytes).decode('utf-8')}"
+                        latest_screen_frame["timestamp"] = time.time()
+                        
+                        if frame_count == 30:  # Log only on first successful capture
+                            print(f"✓ Screen frame captured and encoded successfully")
+                    except Exception as e:
+                        print(f"⚠️  Error encoding video frame: {e}")
+        
+        # Start the stream reading task
+        task = asyncio.create_task(read_stream())
+        task.add_done_callback(lambda t: self._tasks.remove(t) if t in self._tasks else None)
+        self._tasks.append(task)
 
 server = AgentServer()
 
@@ -88,6 +192,68 @@ async def my_agent(ctx: agents.JobContext):
     # Connect to the room first
     await ctx.connect()
     print("✓ Agent connected to room")
+    
+    # Log all existing participants and their tracks
+    print(f"\n📊 Room state after connection:")
+    print(f"  Remote participants: {len(ctx.room.remote_participants)}")
+    for remote_participant in ctx.room.remote_participants.values():
+        print(f"  - Participant: {remote_participant.identity}")
+        print(f"    Track publications: {len(remote_participant.track_publications)}")
+        for pub in remote_participant.track_publications.values():
+            print(f"      {pub.kind} (source: {pub.source}, subscribed: {pub.subscribed}, track: {pub.track is not None})")
+    print()
+    
+    # Debug: Track audio frames received
+    received_audio_frames = {"count": 0, "logged": False}
+    
+    # Helper function to set up audio frame listener for a track
+    def setup_audio_listener(track: rtc.Track, participant: rtc.RemoteParticipant):
+        """Set up audio frame listener for debugging"""
+        if track.kind == rtc.TrackKind.KIND_AUDIO:
+            print(f"🎤 Setting up audio frame listener for {participant.identity}")
+            audio_stream = rtc.AudioStream(track)
+            
+            async def count_audio_frames():
+                try:
+                    async for frame_event in audio_stream:
+                        received_audio_frames["count"] += 1
+                        if not received_audio_frames["logged"] and received_audio_frames["count"] >= 10:
+                            print(f"✓ ✓ ✓ RECEIVING AUDIO FRAMES from user! (count: {received_audio_frames['count']})")
+                            received_audio_frames["logged"] = True
+                except Exception as e:
+                    print(f"⚠️  Error in audio frame listener: {e}")
+            
+            asyncio.create_task(count_audio_frames())
+    
+    # Add track subscription handler (consolidated - handles both debugging and audio frame setup)
+    @ctx.room.on("track_subscribed")
+    def on_track_subscribed(
+        track: rtc.Track,
+        publication: rtc.RemoteTrackPublication,
+        participant: rtc.RemoteParticipant
+    ):
+        print(f"📡 Track subscribed:")
+        print(f"  - Participant: {participant.identity}")
+        print(f"  - Track Kind: {track.kind}")
+        print(f"  - Track Source: {publication.source}")
+        print(f"  - Track SID: {track.sid}")
+        print(f"  - Muted: {publication.muted}")
+        
+        if track.kind == rtc.TrackKind.KIND_AUDIO:
+            if publication.source == rtc.TrackSource.SOURCE_MICROPHONE:
+                print(f"🎤 ✓ MICROPHONE audio track subscribed successfully!")
+                # Set up audio frame listener for debugging
+                setup_audio_listener(track, participant)
+            else:
+                print(f"🔊 Audio track subscribed (source: {publication.source})")
+    
+    @ctx.room.on("track_unsubscribed")
+    def on_track_unsubscribed(
+        track: rtc.Track,
+        publication: rtc.RemoteTrackPublication,
+        participant: rtc.RemoteParticipant
+    ):
+        print(f"📡 Track unsubscribed: {track.kind} from {participant.identity}")
     
     # Start recording to S3
     try:
@@ -173,15 +339,74 @@ async def my_agent(ctx: agents.JobContext):
     # Default instructions - will be updated from AccessToken metadata
     custom_instructions = "You are a helpful voice AI assistant."
     greeting_instructions = "Greet the user and offer your assistance. You should start by speaking in English."
+    voice = "alloy"  # Default voice
     
     # Wait for participant to join and read their metadata
     try:
         print("⏳ Waiting for participant to join...")
         participant = await ctx.wait_for_participant()
+        print(f"✓ Participant joined: {participant.identity}")
+        
+        # CRITICAL: Check for existing audio tracks and ensure they're subscribed
+        print("🔍 Checking for existing audio tracks from participant...")
+        audio_track_found = False
+        for publication in participant.track_publications.values():
+            print(f"  Found track publication: {publication.kind} (source: {publication.source}, subscribed: {publication.subscribed})")
+            if publication.kind == rtc.TrackKind.KIND_AUDIO and publication.source == rtc.TrackSource.SOURCE_MICROPHONE:
+                audio_track_found = True
+                if not publication.subscribed:
+                    print(f"  ⚠️  Audio track exists but not subscribed, subscribing now...")
+                    try:
+                        await publication.set_subscribed(True)
+                        # Wait a moment for subscription to complete
+                        await asyncio.sleep(0.2)
+                        print(f"  ✓ Subscribed to audio track")
+                        # Set up listener if track is now available
+                        if publication.track:
+                            setup_audio_listener(publication.track, participant)
+                    except Exception as sub_error:
+                        print(f"  ❌ Error subscribing to audio track: {sub_error}")
+                elif publication.track:
+                    print(f"  ✓ Audio track already subscribed, setting up listener")
+                    setup_audio_listener(publication.track, participant)
+        
+        if not audio_track_found:
+            print("  ⚠️  No microphone audio track found yet (user may publish it later)")
+            print("  ℹ️  Waiting for user to publish audio track...")
+            # Wait a bit for the user to publish their audio track
+            max_wait_time = 5.0  # Wait up to 5 seconds
+            wait_interval = 0.5
+            waited = 0.0
+            while waited < max_wait_time and not audio_track_found:
+                await asyncio.sleep(wait_interval)
+                waited += wait_interval
+                # Check again for audio tracks
+                for pub in participant.track_publications.values():
+                    if pub.kind == rtc.TrackKind.KIND_AUDIO and pub.source == rtc.TrackSource.SOURCE_MICROPHONE:
+                        audio_track_found = True
+                        print(f"  ✓ Found audio track after waiting {waited:.1f}s")
+                        if not pub.subscribed:
+                            print(f"  ⚠️  Subscribing to audio track...")
+                            await pub.set_subscribed(True)
+                            await asyncio.sleep(0.2)
+                        if pub.track:
+                            setup_audio_listener(pub.track, participant)
+                        break
+                if audio_track_found:
+                    break
+            
+            if not audio_track_found:
+                print(f"  ⚠️  Still no audio track after {max_wait_time}s wait")
+                print("  ℹ️  Audio track subscription will be handled by track_subscribed event handler")
         
         if participant.metadata:
             metadata = json.loads(participant.metadata)
             prompt = metadata.get("prompt", "")
+            voice_from_metadata = metadata.get("voice", "")
+            
+            if voice_from_metadata:
+                voice = voice_from_metadata
+                print(f"✓ Voice set to: {voice}")
             
             if prompt:
                 custom_instructions = prompt
@@ -201,7 +426,7 @@ async def my_agent(ctx: agents.JobContext):
     # Create session with the instructions from AccessToken metadata or default
     session = AgentSession(
         llm=openai.realtime.RealtimeModel(
-            voice="coral"
+            voice=voice
         )
     )
 
@@ -618,15 +843,40 @@ async def my_agent(ctx: agents.JobContext):
     # Set the reference so handlers can access it
     send_transcript_ref["func"] = send_transcript_to_frontend
 
+    # CRITICAL: Before starting session, ensure we subscribe to all remote participant audio tracks
+    print("\n🔍 Pre-session: Checking for remote participant audio tracks...")
+    for remote_participant in ctx.room.remote_participants.values():
+        print(f"  Checking participant: {remote_participant.identity}")
+        for publication in remote_participant.track_publications.values():
+            if publication.kind == rtc.TrackKind.KIND_AUDIO and publication.source == rtc.TrackSource.SOURCE_MICROPHONE:
+                print(f"  ✓ Found microphone audio track: subscribed={publication.subscribed}, track={publication.track is not None}")
+                if not publication.subscribed:
+                    print(f"  ⚠️  Track not subscribed, subscribing now...")
+                    try:
+                        await publication.set_subscribed(True)
+                        await asyncio.sleep(0.3)  # Wait for subscription to complete
+                        print(f"  ✓ Successfully subscribed to audio track")
+                        if publication.track:
+                            setup_audio_listener(publication.track, remote_participant)
+                    except Exception as sub_err:
+                        print(f"  ❌ Error subscribing: {sub_err}")
+                elif publication.track:
+                    print(f"  ✓ Track already subscribed, setting up listener")
+                    setup_audio_listener(publication.track, remote_participant)
+    
+    print("🚀 Starting agent session...")
     await session.start(
         room=ctx.room,
-        agent=Assistant(instructions=custom_instructions),
+        agent=Assistant(instructions=custom_instructions, room=ctx.room),
         room_options=room_io.RoomOptions(
             audio_input=room_io.AudioInputOptions(
                 noise_cancellation=lambda params: noise_cancellation.BVCTelephony() if params.participant.kind == rtc.ParticipantKind.PARTICIPANT_KIND_SIP else noise_cancellation.BVC(),
             ),
+            # Enable video input for multimodal capabilities
+            video_input=True,
         ),
     )
+    print("✓ Agent session started")
     
     # Set up transcription event listeners after session starts
     # Use synchronous callbacks that create async tasks
