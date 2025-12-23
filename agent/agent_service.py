@@ -468,8 +468,19 @@ async def my_agent(ctx: agents.JobContext):
         
         if participant.metadata:
             metadata = json.loads(participant.metadata)
+            print(f"\n{'='*60}")
+            print(f"📋 Participant metadata keys: {list(metadata.keys())}")
+            print(f"{'='*60}\n")
+            
             prompt = metadata.get("prompt", "")
             voice_from_metadata = metadata.get("voice", "")
+            greeting_from_metadata = metadata.get("greetingInstructions", "")
+            
+            # Also try alternative key names in case of case sensitivity issues
+            if not greeting_from_metadata:
+                greeting_from_metadata = metadata.get("greeting_instructions", "")
+            if not greeting_from_metadata:
+                greeting_from_metadata = metadata.get("greetinginstructions", "")
             
             if voice_from_metadata:
                 voice = voice_from_metadata
@@ -484,6 +495,18 @@ async def my_agent(ctx: agents.JobContext):
                 print(f"{'='*60}\n")
             else:
                 print("⚠️  No prompt found in participant metadata, using default instructions")
+            
+            if greeting_from_metadata:
+                greeting_instructions = greeting_from_metadata
+                print(f"\n{'='*60}")
+                print(f"✅ Greeting instructions read from AccessToken metadata")
+                print(f"{'='*60}")
+                print(f"Greeting: {greeting_instructions}")
+                print(f"{'='*60}\n")
+            else:
+                print(f"⚠️  No greeting instructions found in participant metadata")
+                print(f"   Available keys: {list(metadata.keys())}")
+                print(f"   Using default greeting: {greeting_instructions}")
         else:
             print("⚠️  No metadata found on participant, using default instructions")
     except Exception as e:
@@ -493,7 +516,8 @@ async def my_agent(ctx: agents.JobContext):
     # Create session with the instructions from AccessToken metadata or default
     session = AgentSession(
         llm=openai.realtime.RealtimeModel(
-            voice=voice
+            voice=voice,
+            model="gpt-realtime-mini"
         )
     )
 
@@ -988,6 +1012,13 @@ async def my_agent(ctx: agents.JobContext):
         """Handle conversation items - synchronous wrapper"""
         asyncio.create_task(handle_conversation_item_async(ev, ctx, session_start_timestamp))
 
+    # Debug: Print the greeting instructions that will be used
+    print(f"\n{'='*60}")
+    print(f"🎤 About to generate greeting with instructions:")
+    print(f"{'='*60}")
+    print(f"{greeting_instructions}")
+    print(f"{'='*60}\n")
+    
     await session.generate_reply(
         instructions=greeting_instructions
     )
