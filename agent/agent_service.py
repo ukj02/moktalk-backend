@@ -29,9 +29,26 @@ from livekit.plugins import (
 )
 from fastapi import FastAPI
 import uvicorn
+import posthog
 
 load_dotenv(".env")
 
+# Initialize PostHog for LLM tracking
+
+from posthog import Posthog
+
+posthog_api_key = os.getenv("POSTHOG_API_KEY")
+posthog_host = os.getenv("POSTHOG_HOST", "https://app.posthog.com")
+posthog_client = None
+if posthog_api_key:
+    posthog_client = posthog.Posthog(
+        project_api_key=posthog_api_key,
+        host=posthog_host
+    )
+    print("✓ PostHog initialized for LLM tracking")
+else:
+    print("⚠️  POSTHOG_API_KEY not configured, LLM tracking disabled")
+    
 # Store room reference for data channel communication
 current_room = None
 # Store transcriptions as they come in
@@ -40,6 +57,56 @@ transcription_history = []
 egress_info_storage = {}
 # Store latest video frame for multimodal context
 latest_screen_frame = {"frame": None, "timestamp": 0}
+
+
+def track_llm_generation(
+    model: str,
+    input_text: str,
+    output_text: str,
+    user_id: Optional[str] = None,
+    room_name: Optional[str] = None,
+    latency_ms: Optional[float] = None,
+    token_usage: Optional[dict] = None,
+    error: Optional[str] = None,
+):
+    """Track LLM generation event in PostHog"""
+    if not posthog_client:
+        return
+
+    try:
+        distinct_id = user_id or room_name or "anonymous"
+
+        # PostHog LLM analytics expects $ai_generation events
+        properties = {
+            "$ai_model": model,
+            "$ai_model_version": model,
+            "$ai_provider": "openai",
+            "$ai_input": input_text[:1000] if input_text else None,  # Limit length
+            "$ai_output": output_text[:1000] if output_text else None,
+            "$ai_input_tokens": token_usage.get("input_tokens") if token_usage else None,
+            "$ai_output_tokens": token_usage.get("output_tokens") if token_usage else None,
+            "$ai_total_tokens": token_usage.get("total_tokens") if token_usage else None,
+            "$ai_latency_ms": latency_ms,
+            "room_name": room_name,
+            "session_type": "livekit_realtime",
+        }
+
+        if error:
+            properties["error"] = error
+
+        # Remove None values
+        properties = {k: v for k, v in properties.items() if v is not None}
+
+        posthog_client.capture(
+            distinct_id=distinct_id,
+            event="$ai_generation",
+            properties=properties,
+        )
+
+        # Flush to ensure event is sent
+        posthog_client.flush()
+    except Exception as e:
+        print(f"⚠️  Error tracking LLM generation: {e}")
 
 
 async def send_transcription(
@@ -540,6 +607,37 @@ async def my_agent(ctx: agents.JobContext):
                     start_time=relative_start,
                     end_time=relative_end,
                 )
+                
+                # Track LLM generation for agent responses
+                if not is_user:
+                    # Extract user ID from participant metadata
+                    user_id = None
+                    for p in ctx_ref.room.remote_participants.values():
+                        if p.metadata:
+                            try:
+                                metadata = json.loads(p.metadata)
+                                user_id = metadata.get("userId") or p.identity
+                                break
+                            except:
+                                pass
+                    
+                    # Get recent user input from transcription history for context
+                    recent_user_input = ""
+                    if transcription_history:
+                        # Get last user message
+                        for item in reversed(transcription_history):
+                            if item.get("role") == "user":
+                                recent_user_input = item.get("message", "")
+                                break
+                    
+                    # Track the generation
+                    track_llm_generation(
+                        model="gpt-4o-realtime-preview",  # OpenAI Realtime API model
+                        input_text=recent_user_input,
+                        output_text=text.strip(),
+                        user_id=user_id,
+                        room_name=ctx_ref.room.name,
+                    )
                 
                 # Trigger sending transcript to frontend (debounced)
                 if send_transcript_ref.get("func"):
