@@ -460,7 +460,7 @@ async def my_agent(ctx: agents.JobContext):
     
     # Default instructions - will be updated from AccessToken metadata
     custom_instructions = "You are a helpful voice AI assistant."
-    greeting_instructions = "Greet the user and offer your assistance. You should start by speaking in English."
+    greeting_instructions = "Begin the interview by introducing yourself. You should start by speaking in English."
     voice = "alloy"  # Default voice
     
     # Wait for participant to join and read their metadata
@@ -506,7 +506,7 @@ async def my_agent(ctx: agents.JobContext):
                     print(f"\n{'='*60}")
                     print(f"✅ Prompt read from AccessToken metadata")
                     print(f"{'='*60}")
-                    print(f"Prompt: {custom_instructions[:200]}...")
+                    print(f"Prompt: {custom_instructions}")
                     print(f"{'='*60}\n")
                 else:
                     print("⚠️  No prompt found in participant metadata, using default instructions")
@@ -537,7 +537,7 @@ async def my_agent(ctx: agents.JobContext):
     session = AgentSession(
         llm=openai.realtime.RealtimeModel(
             voice=voice,
-            model="gpt-realtime-mini"
+            model="gpt-realtime"
         )
     )
 
