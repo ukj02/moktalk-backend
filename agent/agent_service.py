@@ -537,7 +537,7 @@ async def my_agent(ctx: agents.JobContext):
     session = AgentSession(
         llm=openai.realtime.RealtimeModel(
             voice=voice,
-            model="gpt-realtime"
+            model="gpt-realtime-mini"
         )
     )
 
