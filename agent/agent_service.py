@@ -5,9 +5,11 @@ import asyncio
 import threading
 import time
 import base64
-from collections import deque
+import psutil
+import gc
+from collections import deque, OrderedDict
 from datetime import datetime
-from typing import AsyncIterable, Optional, List, Dict, Set
+from typing import AsyncIterable, Optional, List, Dict
 from dataclasses import dataclass, field
 from dotenv import load_dotenv
 
@@ -36,21 +38,56 @@ load_dotenv(".env")
 
 # Constants
 MAX_TRANSCRIPTION_HISTORY = 1000  # Limit transcription history size
+MEMORY_LOG_INTERVAL_SECONDS = 60  # Log memory usage every 60 seconds
+
+
+def get_memory_usage() -> Dict:
+    """Get current memory usage statistics"""
+    process = psutil.Process()
+    mem_info = process.memory_info()
+    return {
+        "rss_mb": mem_info.rss / 1024 / 1024,  # Resident Set Size (actual memory used)
+        "vms_mb": mem_info.vms / 1024 / 1024,  # Virtual Memory Size
+        "percent": process.memory_percent(),
+    }
+
+
+def log_memory(context: str = ""):
+    """Log current memory usage with optional context"""
+    mem = get_memory_usage()
+    prefix = f"[{context}] " if context else ""
+    print(f"📊 {prefix}Memory: {mem['rss_mb']:.1f} MB RSS, {mem['vms_mb']:.1f} MB VMS ({mem['percent']:.1f}%)")
+    return mem
+
+
+async def periodic_memory_logger():
+    """Background task to log memory usage periodically"""
+    while True:
+        try:
+            await asyncio.sleep(MEMORY_LOG_INTERVAL_SECONDS)
+            mem = get_memory_usage()
+            active_sessions = len(egress_info_storage)
+            print(f"📊 [Periodic] Memory: {mem['rss_mb']:.1f} MB RSS | Active egress sessions: {active_sessions}")
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            print(f"⚠️  Error in memory logger: {e}")
 VIDEO_FRAME_SAMPLE_RATE = 30  # Sample every 30 frames (1 second at 30fps)
-VIDEO_FRAME_WIDTH = 1024
-VIDEO_FRAME_HEIGHT = 1024
-VIDEO_FRAME_QUALITY = 85
+VIDEO_FRAME_WIDTH = 512  # Reduced from 1024 for lower memory (~4x smaller per frame)
+VIDEO_FRAME_HEIGHT = 512
+VIDEO_FRAME_QUALITY = 72  # Reduced from 85 for lower memory, still good for screen content
 SCREEN_FRAME_MAX_AGE_SECONDS = 5
 TRANSCRIPT_DEBOUNCE_SECONDS = 5
 AUDIO_TRACK_WAIT_TIME = 5.0
+MAX_EGRESS_STORAGE_ENTRIES = 50  # Prevent unbounded growth if cleanup fails
 AUDIO_TRACK_WAIT_INTERVAL = 0.5
 AUDIO_SUBSCRIPTION_DELAY = 0.2
 RECORDING_STATUS_CHECK_DELAY = 2
 TRANSCRIPT_PREVIEW_ITEMS = 3
 
 # Global storage for egress info (room_name -> egress_data)
-# This is acceptable as it's keyed by room name and cleaned up after sessions
-egress_info_storage: Dict[str, Dict] = {}
+# OrderedDict maintains insertion order for eviction when over limit
+egress_info_storage: OrderedDict[str, Dict] = OrderedDict()
 
 
 @dataclass
@@ -63,7 +100,9 @@ class SessionContext:
     session_start_time: datetime = field(default_factory=datetime.now)
     session_start_timestamp: float = field(default_factory=lambda: datetime.now().timestamp())
     last_transcript_send_time: float = 0
-    transcript_seen: Set[tuple] = field(default_factory=set)  # For O(1) duplicate checking
+    # Track async tasks and streams for cleanup
+    audio_tasks: List = field(default_factory=list)
+    audio_streams: List = field(default_factory=list)
 
 
 async def send_transcription(
@@ -300,6 +339,7 @@ async def my_agent(ctx: agents.JobContext):
     print(f"\n{'='*60}")
     print(f"🤖 Agent detected room: {ctx.room.name}")
     print(f"{'='*60}")
+    log_memory("Session Start")
     
     # Create session context to manage per-session state
     session_ctx = SessionContext(room=ctx.room)
@@ -327,6 +367,8 @@ async def my_agent(ctx: agents.JobContext):
         if track.kind == rtc.TrackKind.KIND_AUDIO:
             print(f"🎤 Setting up audio frame listener for {participant.identity}")
             audio_stream = rtc.AudioStream(track)
+            # Track stream for cleanup
+            session_ctx.audio_streams.append(audio_stream)
             
             async def count_audio_frames():
                 try:
@@ -335,10 +377,19 @@ async def my_agent(ctx: agents.JobContext):
                         if not received_audio_frames["logged"] and received_audio_frames["count"] >= 10:
                             print(f"✓ ✓ ✓ RECEIVING AUDIO FRAMES from user! (count: {received_audio_frames['count']})")
                             received_audio_frames["logged"] = True
+                except asyncio.CancelledError:
+                    print(f"ℹ️  Audio frame listener cancelled for {participant.identity}")
                 except Exception as e:
                     print(f"⚠️  Error in audio frame listener: {e}")
+                finally:
+                    # Clean up stream reference
+                    if audio_stream in session_ctx.audio_streams:
+                        session_ctx.audio_streams.remove(audio_stream)
             
-            asyncio.create_task(count_audio_frames())
+            task = asyncio.create_task(count_audio_frames())
+            # Track task for cleanup
+            session_ctx.audio_tasks.append(task)
+            task.add_done_callback(lambda t: session_ctx.audio_tasks.remove(t) if t in session_ctx.audio_tasks else None)
     
     # Helper to get user participant (cached in session context)
     def get_user_participant_cached() -> Optional[rtc.RemoteParticipant]:
@@ -430,12 +481,21 @@ async def my_agent(ctx: agents.JobContext):
             
             egress_info = await lkapi.egress.start_room_composite_egress(egress_request)
             
-            # Store egress info for later status checking
-            egress_info_storage[ctx.room.name] = {
+            # Store egress info for later status checking (evict oldest if over limit)
+            room_name = ctx.room.name
+            if room_name in egress_info_storage:
+                del egress_info_storage[room_name]
+            egress_info_storage[room_name] = {
                 "egress_id": egress_info.egress_id,
                 "s3_path": filepath,
                 "lkapi": lkapi,  # Store API client for status checking
             }
+            while len(egress_info_storage) > MAX_EGRESS_STORAGE_ENTRIES:
+                _, oldest = egress_info_storage.popitem(last=False)
+                try:
+                    await oldest["lkapi"].aclose()
+                except Exception:
+                    pass
             
             print(f"✓ Recording started successfully")
             print(f"  Egress ID: {egress_info.egress_id}")
@@ -930,6 +990,63 @@ async def my_agent(ctx: agents.JobContext):
     # Store reference to send function so handlers can call it
     send_transcript_ref = {"func": None}
     
+    assistant_ref: Dict = {}
+
+    async def cleanup_session_memory():
+        """Clean up all session resources to prevent memory leaks"""
+        print("🧹 Cleaning up session memory...")
+        log_memory("Before Cleanup")
+        
+        # Free base64 image string
+        session_ctx.latest_screen_frame["frame"] = None
+        
+        # Cancel and clean up audio listener tasks
+        if session_ctx.audio_tasks:
+            print(f"  Cancelling {len(session_ctx.audio_tasks)} audio tasks...")
+            for task in session_ctx.audio_tasks:
+                task.cancel()
+            await asyncio.gather(*session_ctx.audio_tasks, return_exceptions=True)
+            session_ctx.audio_tasks.clear()
+        
+        # Close audio streams
+        if session_ctx.audio_streams:
+            print(f"  Closing {len(session_ctx.audio_streams)} audio streams...")
+            for stream in session_ctx.audio_streams:
+                try:
+                    stream.close()
+                except Exception:
+                    pass
+            session_ctx.audio_streams.clear()
+        
+        # Clean up video stream and tasks from Assistant
+        if assistant_ref.get("agent"):
+            agent = assistant_ref["agent"]
+            if agent._video_stream:
+                try:
+                    agent._video_stream.close()
+                except Exception:
+                    pass
+            if agent._tasks:
+                print(f"  Cancelling {len(agent._tasks)} video tasks...")
+                for task in agent._tasks:
+                    task.cancel()
+                await asyncio.gather(*agent._tasks, return_exceptions=True)
+                agent._tasks.clear()
+        
+        # Clear transcription history
+        session_ctx.transcription_history.clear()
+        
+        # Clear user participant reference
+        session_ctx.user_participant = None
+        
+        # Force garbage collection to release memory back to OS
+        gc.collect()
+        
+        log_memory("After Cleanup")
+        print("✓ Session memory cleanup complete")
+
+    ctx.add_shutdown_callback(cleanup_session_memory)
+
     # Register the shutdown callbacks
     ctx.add_shutdown_callback(check_recording_status)
     ctx.add_shutdown_callback(save_transcript)
@@ -949,9 +1066,11 @@ async def my_agent(ctx: agents.JobContext):
         await ensure_audio_track_subscribed(remote_participant, setup_audio_listener)
     
     print("🚀 Starting agent session...")
+    assistant = Assistant(instructions=custom_instructions, room=ctx.room, session_ctx=session_ctx)
+    assistant_ref["agent"] = assistant
     await session.start(
         room=ctx.room,
-        agent=Assistant(instructions=custom_instructions, room=ctx.room, session_ctx=session_ctx),
+        agent=assistant,
         room_options=room_io.RoomOptions(
             audio_input=room_io.AudioInputOptions(
                 noise_cancellation=lambda params: noise_cancellation.BVCTelephony() if params.participant.kind == rtc.ParticipantKind.PARTICIPANT_KIND_SIP else noise_cancellation.BVC(),
@@ -992,12 +1111,30 @@ health_app = FastAPI()
 @health_app.get("/health")
 async def health_check():
     """Health check endpoint for Railway"""
-    return {"status": "healthy", "service": "moktalk-agent"}
+    mem = get_memory_usage()
+    return {
+        "status": "healthy",
+        "service": "moktalk-agent",
+        "memory_mb": round(mem["rss_mb"], 1),
+        "memory_percent": round(mem["percent"], 1),
+    }
 
 @health_app.get("/")
 async def root():
     """Root endpoint"""
     return {"status": "ok", "service": "moktalk-agent"}
+
+@health_app.get("/memory")
+async def memory_stats():
+    """Detailed memory statistics endpoint"""
+    mem = get_memory_usage()
+    return {
+        "rss_mb": round(mem["rss_mb"], 1),
+        "vms_mb": round(mem["vms_mb"], 1),
+        "percent": round(mem["percent"], 1),
+        "active_egress_sessions": len(egress_info_storage),
+        "timestamp": datetime.now().isoformat(),
+    }
 
 def run_health_server():
     """Run health check server in background thread"""
@@ -1006,10 +1143,24 @@ def run_health_server():
 
 
 if __name__ == "__main__":
+    # Log initial memory usage
+    log_memory("Startup")
+    
     # Start health check server in background thread for Railway
     health_thread = threading.Thread(target=run_health_server, daemon=True)
     health_thread.start()
     print(f"✅ Health check server started on port {os.getenv('PORT', 8080)}")
+    
+    # Start periodic memory logger in background
+    def start_memory_logger():
+        """Start the periodic memory logger in the event loop"""
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(periodic_memory_logger())
+    
+    memory_thread = threading.Thread(target=start_memory_logger, daemon=True)
+    memory_thread.start()
+    print(f"✅ Memory logger started (interval: {MEMORY_LOG_INTERVAL_SECONDS}s)")
     
     # Start the agent service
     agents.cli.run_app(server)
