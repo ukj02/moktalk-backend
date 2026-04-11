@@ -13,17 +13,17 @@ from typing import AsyncIterable, Optional, List, Dict
 from dataclasses import dataclass, field
 from dotenv import load_dotenv
 
+from helpers import get_metadata_value, is_debug_audio_enabled
+
 from livekit import agents, rtc, api
 from livekit.agents import (
-    AgentServer, 
-    AgentSession, 
-    Agent, 
+    AgentServer,
+    AgentSession,
+    Agent,
     room_io,
     llm,
     ChatContext,
     ChatMessage,
-    FunctionTool,
-    ModelSettings,
 )
 from livekit.agents.llm import ImageContent
 from livekit.agents.utils import images
@@ -60,16 +60,14 @@ def log_memory(context: str = ""):
     return mem
 
 
-async def periodic_memory_logger():
-    """Background task to log memory usage periodically"""
+def periodic_memory_logger_sync():
+    """Background thread: log memory periodically without a second asyncio event loop."""
     while True:
         try:
-            await asyncio.sleep(MEMORY_LOG_INTERVAL_SECONDS)
+            time.sleep(MEMORY_LOG_INTERVAL_SECONDS)
             mem = get_memory_usage()
             active_sessions = len(egress_info_storage)
             print(f"📊 [Periodic] Memory: {mem['rss_mb']:.1f} MB RSS | Active egress sessions: {active_sessions}")
-        except asyncio.CancelledError:
-            break
         except Exception as e:
             print(f"⚠️  Error in memory logger: {e}")
 VIDEO_FRAME_SAMPLE_RATE = 30  # Sample every 30 frames (1 second at 30fps)
@@ -154,25 +152,6 @@ def get_user_participant(room: rtc.Room, local_identity: str) -> Optional[rtc.Re
         if participant.identity != local_identity:
             return participant
     return None
-
-
-def get_metadata_value(metadata: Dict, keys: List[str], default: str = "") -> str:
-    """Get metadata value trying multiple key variations (case-insensitive)"""
-    if not metadata:
-        return default
-    
-    # Try exact match first
-    for key in keys:
-        if key in metadata:
-            return metadata.get(key, default)
-    
-    # Try case-insensitive match
-    metadata_lower = {k.lower(): v for k, v in metadata.items()}
-    for key in keys:
-        if key.lower() in metadata_lower:
-            return metadata_lower[key.lower()]
-    
-    return default
 
 
 async def ensure_audio_track_subscribed(
@@ -363,7 +342,9 @@ async def my_agent(ctx: agents.JobContext):
     
     # Helper function to set up audio frame listener for a track
     def setup_audio_listener(track: rtc.Track, participant: rtc.RemoteParticipant):
-        """Set up audio frame listener for debugging"""
+        """Set up audio frame listener for debugging (disabled unless AGENT_DEBUG_AUDIO is set)."""
+        if not is_debug_audio_enabled():
+            return
         if track.kind == rtc.TrackKind.KIND_AUDIO:
             print(f"🎤 Setting up audio frame listener for {participant.identity}")
             audio_stream = rtc.AudioStream(track)
@@ -437,8 +418,7 @@ async def my_agent(ctx: agents.JobContext):
         livekit_url = os.getenv("LIVEKIT_URL")
         livekit_api_key = os.getenv("LIVEKIT_API_KEY")
         livekit_api_secret = os.getenv("LIVEKIT_API_SECRET")
-        webhook_url = os.getenv("LIVEKIT_WEBHOOK_URL")
-        
+
         if aws_access_key_id and aws_secret_access_key and livekit_url and livekit_api_key and livekit_api_secret:
             print(f"\n{'='*60}")
             print("🎥 Starting recording to S3...")
@@ -1045,17 +1025,27 @@ async def my_agent(ctx: agents.JobContext):
         log_memory("After Cleanup")
         print("✓ Session memory cleanup complete")
 
-    ctx.add_shutdown_callback(cleanup_session_memory)
+    async def sequential_job_shutdown(_reason: str) -> None:
+        """LiveKit invokes all shutdown callbacks concurrently; use a single callback for ordered teardown."""
+        try:
+            await send_transcript_to_frontend(force=True)
+        except Exception as e:
+            print(f"⚠️ Shutdown: failed to send transcript to frontend: {e}")
+        try:
+            await save_transcript()
+        except Exception as e:
+            print(f"⚠️ Shutdown: failed to save transcript: {e}")
+        try:
+            await check_recording_status()
+        except Exception as e:
+            print(f"⚠️ Shutdown: failed to check recording status: {e}")
+        try:
+            await cleanup_session_memory()
+        except Exception as e:
+            print(f"⚠️ Shutdown: failed session cleanup: {e}")
 
-    # Register the shutdown callbacks
-    ctx.add_shutdown_callback(check_recording_status)
-    ctx.add_shutdown_callback(save_transcript)
-    
-    # Also try to send transcript on shutdown (force send)
-    async def send_on_shutdown():
-        await send_transcript_to_frontend(force=True)
-    ctx.add_shutdown_callback(send_on_shutdown)
-    
+    ctx.add_shutdown_callback(sequential_job_shutdown)
+
     # Set the reference so handlers can access it
     send_transcript_ref["func"] = send_transcript_to_frontend
 
@@ -1142,25 +1132,20 @@ def run_health_server():
     uvicorn.run(health_app, host="0.0.0.0", port=port, log_level="warning")
 
 
-if __name__ == "__main__":
-    # Log initial memory usage
+def entrypoint() -> None:
+    """Console script entry (`moktalk-agent` in pyproject.toml) and shared startup path."""
     log_memory("Startup")
-    
-    # Start health check server in background thread for Railway
+
     health_thread = threading.Thread(target=run_health_server, daemon=True)
     health_thread.start()
     print(f"✅ Health check server started on port {os.getenv('PORT', 8080)}")
-    
-    # Start periodic memory logger in background
-    def start_memory_logger():
-        """Start the periodic memory logger in the event loop"""
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        loop.run_until_complete(periodic_memory_logger())
-    
-    memory_thread = threading.Thread(target=start_memory_logger, daemon=True)
+
+    memory_thread = threading.Thread(target=periodic_memory_logger_sync, daemon=True)
     memory_thread.start()
     print(f"✅ Memory logger started (interval: {MEMORY_LOG_INTERVAL_SECONDS}s)")
-    
-    # Start the agent service
+
     agents.cli.run_app(server)
+
+
+if __name__ == "__main__":
+    entrypoint()

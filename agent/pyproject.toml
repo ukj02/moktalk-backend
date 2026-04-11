@@ -74,7 +74,7 @@ ignore = [
 ]
 
 [tool.ruff.isort]
-known-first-party = ["agent_service"]
+known-first-party = ["agent_service", "helpers"]
 
 [tool.mypy]
 python_version = "3.9"
@@ -82,4 +82,9 @@ warn_return_any = true
 warn_unused_configs = true
 disallow_untyped_defs = false
 ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+asyncio_mode = "auto"
 

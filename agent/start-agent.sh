@@ -19,15 +19,20 @@ if [ ! -f .env ]; then
     exit 1
 fi
 
-# Check if Python is available
-if ! command -v python &> /dev/null; then
+# Resolve Python (macOS often has python3 but not python)
+PYTHON=""
+if command -v python3 &> /dev/null; then
+    PYTHON=python3
+elif command -v python &> /dev/null; then
+    PYTHON=python
+else
     echo "❌ Error: Python not found!"
-    echo "Please install Python 3.10 or higher"
+    echo "Install Python 3.10+ (e.g. brew install python@3.12) and ensure python3 is on your PATH."
     exit 1
 fi
 
 # Check if dependencies are installed
-if ! python -c "import livekit" &> /dev/null; then
+if ! "$PYTHON" -c "import livekit" &> /dev/null; then
     echo "⚠️  Dependencies not installed. Installing now..."
     echo ""
     
@@ -36,7 +41,7 @@ if ! python -c "import livekit" &> /dev/null; then
         uv pip install -r requirements.txt
     else
         echo "Using pip to install dependencies..."
-        pip install -r requirements.txt
+        "$PYTHON" -m pip install -r requirements.txt
     fi
     
     echo ""
@@ -53,6 +58,6 @@ echo "────────────────────────�
 echo ""
 
 # Start the agent service
-python agent_service.py start
+"$PYTHON" agent_service.py start
 
 
