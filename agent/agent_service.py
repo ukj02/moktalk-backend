@@ -311,7 +311,7 @@ class Assistant(Agent):
         task.add_done_callback(lambda t: self._tasks.remove(t) if t in self._tasks else None)
         self._tasks.append(task)
 
-server = AgentServer()
+server = AgentServer(num_idle_processes=1)
 
 @server.rtc_session()
 async def my_agent(ctx: agents.JobContext):
